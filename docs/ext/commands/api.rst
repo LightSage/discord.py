@@ -346,6 +346,22 @@ Converters
 
     For more information, check :ref:`ext_commands_special_converters`.
 
+.. _ext_commands_api_custom_default:
+
+Default Parameters
+-------------------
+
+.. autoclass:: discord.ext.commands.CustomDefault
+    :members:
+
+.. autoclass:: discord.ext.commands.default.Author
+
+.. autoclass:: discord.ext.commands.default.CurrentChannel
+
+.. autoclass:: discord.ext.commands.default.CurrentGuild
+
+.. autoclass:: discord.ext.commands.default.Call
+
 .. _ext_commands_api_errors:
 
 Exceptions
