@@ -40,6 +40,7 @@ import discord
 from .errors import *
 from .cooldowns import Cooldown, BucketType, CooldownMapping, MaxConcurrency, DynamicCooldownMapping
 from .converter import run_converters, get_converter, Greedy
+from . import default as defaults
 from ._types import _BaseCommand
 from .cog import Cog
 
@@ -470,6 +471,19 @@ class Command(_BaseCommand):
         finally:
             ctx.bot.dispatch('command_error', ctx, error)
 
+    async def _resolve_default(self, ctx, param):
+        try:
+            if inspect.isclass(param.default) and issubclass(param.default, defaults.CustomDefault):
+                instance = param.default()
+                return await instance.default(ctx=ctx, param=param)
+            elif isinstance(param.default, defaults.CustomDefault):
+                return await param.default.default(ctx=ctx, param=param)
+        except CommandError as e:
+            raise e
+        except Exception as e:
+            raise ConversionError(param.default, e) from e
+        return param.default
+
     async def transform(self, ctx, param):
         required = param.default is param.empty
         converter = get_converter(param)
@@ -499,7 +513,7 @@ class Command(_BaseCommand):
                 if hasattr(converter, '__commands_is_flag__') and converter._can_be_constructible():
                     return await converter._construct_default(ctx)
                 raise MissingRequiredArgument(param)
-            return param.default
+            return await self._resolve_default(ctx, param)
 
         previous = view.index
         if consume_rest_is_special:
@@ -528,7 +542,7 @@ class Command(_BaseCommand):
                 result.append(value)
 
         if not result and not required:
-            return param.default
+            return await self._resolve_default(ctx, param)
         return result
 
     async def _transform_greedy_var_pos(self, ctx, param, converter):
@@ -541,7 +555,7 @@ class Command(_BaseCommand):
             view.index = previous
             raise RuntimeError() from None # break loop
         else:
-            return value
+            return value or await self._resolve_default(ctx, param)
 
     @property
     def clean_params(self) -> Dict[str, inspect.Parameter]:
