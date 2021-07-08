@@ -71,6 +71,7 @@ __all__ = (
     'CategoryChannelConverter',
     'IDConverter',
     'StoreChannelConverter',
+    'ThreadConverter',
     'GuildChannelConverter',
     'clean_content',
     'Greedy',
@@ -426,6 +427,28 @@ class GuildChannelConverter(IDConverter[discord.abc.GuildChannel]):
 
         return result
 
+    @staticmethod
+    def _resolve_thread(ctx: Context, argument: str, attribute: str, type: Type[CT]) -> CT:
+        bot = ctx.bot
+
+        match = IDConverter._get_id_match(argument) or re.match(r'<#([0-9]{15,20})>$', argument)
+        result = None
+        guild = ctx.guild
+
+        if match is None:
+            # not a mention
+            if guild:
+                iterable: Iterable[CT] = getattr(guild, attribute)
+                result: Optional[CT] = discord.utils.get(iterable, name=argument)
+        else:
+            thread_id = int(match.group(1))
+            if guild:
+                result = guild.get_thread(thread_id)
+
+        if not result or not isinstance(result, type):
+            raise ThreadNotFound(argument)
+
+        return result
 
 class TextChannelConverter(IDConverter[discord.TextChannel]):
     """Converts to a :class:`~discord.TextChannel`.
@@ -524,6 +547,22 @@ class StoreChannelConverter(IDConverter[discord.StoreChannel]):
     async def convert(self, ctx: Context, argument: str) -> discord.StoreChannel:
         return GuildChannelConverter._resolve_channel(ctx, argument, 'channels', discord.StoreChannel)
 
+class ThreadConverter(IDConverter[discord.Thread]):
+    """Coverts to a :class:`~discord.Thread`.
+
+    All lookups are via the local guild.
+
+    The lookup strategy is as follows (in order):
+
+    1. Lookup by ID.
+    2. Lookup by mention.
+    3. Lookup by name.
+
+    .. versionadded: 2.0
+    """
+
+    async def convert(self, ctx: Context, argument: str) -> discord.Thread:
+        return GuildChannelConverter._resolve_thread(ctx, argument, 'threads', discord.Thread)
 
 class ColourConverter(Converter[discord.Colour]):
     """Converts to a :class:`~discord.Colour`.
@@ -779,67 +818,60 @@ class clean_content(Converter[str]):
         .. versionadded:: 1.7
     """
 
-    def __init__(self, *, fix_channel_mentions: bool = False, use_nicknames: bool = True, escape_markdown: bool = False, remove_markdown: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fix_channel_mentions: bool = False,
+        use_nicknames: bool = True,
+        escape_markdown: bool = False,
+        remove_markdown: bool = False
+    ) -> None:
         self.fix_channel_mentions = fix_channel_mentions
         self.use_nicknames = use_nicknames
         self.escape_markdown = escape_markdown
         self.remove_markdown = remove_markdown
 
     async def convert(self, ctx: Context, argument: str) -> str:
-        message = ctx.message
-        transformations = {}
-
-        if self.fix_channel_mentions and ctx.guild:
-
-            def resolve_channel(id, *, _get=ctx.guild.get_channel):
-                ch = _get(id)
-                return f'<#{id}>', ('#' + ch.name if ch else '#deleted-channel')
-
-            transformations.update(resolve_channel(channel) for channel in message.raw_channel_mentions)
-
-        if self.use_nicknames and ctx.guild:
-
-            def resolve_member(id, *, _get=ctx.guild.get_member):
-                m = _get(id)
-                return '@' + m.display_name if m else '@deleted-user'
-
-        else:
-
-            def resolve_member(id, *, _get=ctx.bot.get_user):
-                m = _get(id)
-                return '@' + m.name if m else '@deleted-user'
-
-        # fmt: off
-        transformations.update(
-            (f'<@{member_id}>', resolve_member(member_id))
-            for member_id in message.raw_mentions
-        )
-
-        transformations.update(
-            (f'<@!{member_id}>', resolve_member(member_id))
-            for member_id in message.raw_mentions
-        )
-        # fmt: on
+        msg = ctx.message
 
         if ctx.guild:
+            def resolve_member(id: int) -> str:
+                m = _utils_get(msg.mentions, id=id) or ctx.guild.get_member(id)
+                return f'@{m.display_name if self.use_nicknames else m.name}' if m else '@deleted-user'
 
-            def resolve_role(_id, *, _find=ctx.guild.get_role):
-                r = _find(_id)
-                return '@' + r.name if r else '@deleted-role'
+            def resolve_role(id: int) -> str:
+                r = _utils_get(msg.role_mentions, id=id) or ctx.guild.get_role(id)
+                return f'@{r.name}' if r else '@deleted-role'
+        else:
+            def resolve_member(id: int) -> str:
+                m = _utils_get(msg.mentions, id=id) or ctx.bot.get_user(id)
+                return f'@{m.name}' if m else '@deleted-user'
 
-            # fmt: off
-            transformations.update(
-                (f'<@&{role_id}>', resolve_role(role_id))
-                for role_id in message.raw_role_mentions
-            )
-            # fmt: on
+            def resolve_role(id: int) -> str:
+                return '@deleted-role'
 
-        def repl(obj):
-            return transformations.get(obj.group(0), '')
+        if self.fix_channel_mentions and ctx.guild:
+            def resolve_channel(id: int) -> str:
+                c = ctx.guild.get_channel(id)
+                return f'#{c.name}' if c else '#deleted-channel'
+        else:
+            def resolve_channel(id: int) -> str:
+                return f'<#{id}>'
 
-        pattern = re.compile('|'.join(transformations.keys()))
-        result = pattern.sub(repl, argument)
+        transforms = {
+            '@': resolve_member,
+            '@!': resolve_member,
+            '#': resolve_channel,
+            '@&': resolve_role,
+        }
 
+        def repl(match: re.Match) -> str:
+            type = match[1]
+            id = int(match[2])
+            transformed = transforms[type](id)
+            return transformed
+
+        result = re.sub(r'<(@[!&]?|#)([0-9]{15,20})>', repl, argument)
         if self.escape_markdown:
             result = discord.utils.escape_markdown(result)
         elif self.remove_markdown:
@@ -947,6 +979,7 @@ CONVERTER_MAPPING: Dict[Type[Any], Any] = {
     discord.PartialEmoji: PartialEmojiConverter,
     discord.CategoryChannel: CategoryChannelConverter,
     discord.StoreChannel: StoreChannelConverter,
+    discord.Thread: ThreadConverter,
     discord.abc.GuildChannel: GuildChannelConverter,
 }
 
